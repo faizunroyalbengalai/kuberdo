@@ -77,6 +77,10 @@ jobs:
         id: meta
         run: |
           REGISTRY="${{ needs.registry.outputs.registry_name }}"
+          if [ -z "$REGISTRY" ]; then
+            # Fall back to the secret value if the job output did not propagate
+            REGISTRY="${{ secrets.DOCR_REGISTRY_NAME }}"
+          fi
           PROJECT_LOWER=$(echo "${{ secrets.PROJECT_NAME }}" \
             | tr '[:upper:]' '[:lower:]' \
             | sed 's/[^a-z0-9-]/-/g' \
@@ -198,7 +202,17 @@ jobs:
           # use. This mirrors the EKS behavior but without the JSON hop.
           ARGS=""
           add_kv() {
-            local KEY="$1"
-            local VAL="$2"
-            if [ -n "$VAL" ]; then
-              ARGS="$ARGS --from-literal=${KEY}=${VAL}"
+            local key="$1" val="$2"
+            [ -n "$val" ] && ARGS="$ARGS --from-literal=${key}=${val}"
+          }
+          add_kv DATABASE_URL    "${{ secrets.DATABASE_URL }}"
+          add_kv DB_HOST         "${{ secrets.DB_HOST }}"
+          add_kv DB_PORT         "${{ secrets.DB_PORT }}"
+          add_kv DB_NAME         "${{ secrets.DB_NAME }}"
+          add_kv DB_USER         "${{ secrets.DB_USER }}"
+          add_kv DB_PASSWORD     "${{ secrets.DB_PASSWORD }}"
+          add_kv NODE_ENV        "production"
+          kubectl create secret generic "${PROJECT_NAME}-env" \
+            --namespace "${NAMESPACE}" \
+            $ARGS \
+            --dry-run=client -o yaml | kubectl apply -f -
