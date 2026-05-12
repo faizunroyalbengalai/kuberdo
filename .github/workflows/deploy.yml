@@ -1,0 +1,379 @@
+name: Deploy — kuberdo
+
+on:
+  workflow_dispatch:
+
+env:
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node24
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - run: npm test --if-present
+
+  # ── Ensure DOCR exists (DO Container Registry is one-per-account) ────────
+  # We do this BEFORE Terraform because Terraform's
+  # digitalocean_container_registry resource fails on "already exists" with
+  # no easy import-or-create idiom. Easier to make it idempotent in shell.
+  registry:
+    name: Ensure DOCR registry
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      registry_name: ${{ steps.ensure.outputs.registry_name }}
+    steps:
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_TOKEN }}
+      - name: Ensure registry exists
+        id: ensure
+        run: |
+          REGISTRY_NAME="${{ secrets.DOCR_REGISTRY_NAME }}"
+          if doctl registry get --format Name --no-header 2>/dev/null | grep -qx "$REGISTRY_NAME"; then
+            echo "DOCR '$REGISTRY_NAME' already exists"
+          elif doctl registry get --format Name --no-header 2>/dev/null | grep -q .; then
+            # An account-level registry exists under a different name — DOCR
+            # is one-per-account, so we reuse it instead of failing.
+            EXISTING=$(doctl registry get --format Name --no-header)
+            REGISTRY_NAME="$EXISTING"
+            echo "DOCR '$EXISTING' already exists under a different name — reusing it"
+          else
+            doctl registry create "$REGISTRY_NAME" \
+              --subscription-tier basic \
+              --region "${{ secrets.DO_REGION }}"
+            echo "Created DOCR '$REGISTRY_NAME'"
+          fi
+          echo "registry_name=$REGISTRY_NAME" >> $GITHUB_OUTPUT
+
+  # ── Build & push image to DOCR ───────────────────────────────────────────
+  build_push:
+    name: Build & Push to DOCR
+    runs-on: ubuntu-latest
+    needs: registry
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_TOKEN }}
+      - name: Login to DOCR
+        run: doctl registry login --expiry-seconds 1800
+      - name: Resolve image tag
+        id: meta
+        run: |
+          REGISTRY="${{ needs.registry.outputs.registry_name }}"
+          PROJECT_LOWER=$(echo "${{ secrets.PROJECT_NAME }}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9-]/-/g' \
+            | sed 's/-\{2,\}/-/g' \
+            | sed 's/^-//; s/-$//')
+          IMAGE="registry.digitalocean.com/${REGISTRY}/${PROJECT_LOWER}:${{ github.sha }}"
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "Built image: ${IMAGE}"
+      - name: Build & push Docker image
+        run: |
+          docker build -t ${{ steps.meta.outputs.image }} .
+          docker push ${{ steps.meta.outputs.image }}
+
+  # ── Provision DOKS cluster ───────────────────────────────────────────────
+  provision:
+    name: Provision DOKS via Terraform
+    runs-on: ubuntu-latest
+    needs: [registry, build_push]
+    outputs:
+      cluster_name: ${{ steps.tf_out.outputs.cluster_name }}
+      namespace:    ${{ steps.tf_out.outputs.namespace }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_SPACE }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}.tfstate" \
+            -backend-config="region=${{ secrets.DO_REGION }}" \
+            -backend-config="access_key=${{ secrets.SPACES_ACCESS_KEY }}" \
+            -backend-config="secret_key=${{ secrets.SPACES_SECRET_KEY }}" \
+            -backend-config="skip_requesting_account_id=true"
+      - name: Import existing DOCR if present
+        working-directory: terraform
+        run: |
+          REGISTRY_NAME="${{ needs.registry.outputs.registry_name }}"
+          # If DOCR already exists, the registry job re-used the existing
+          # name. terraform apply would still fail trying to create it —
+          # import it into state first.
+          terraform import \
+            -var="do_token=${{ secrets.DO_TOKEN }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="do_region=${{ secrets.DO_REGION }}" \
+            -var="registry_name=${REGISTRY_NAME}" \
+            digitalocean_container_registry.app "$REGISTRY_NAME" 2>/dev/null || true
+      - name: Terraform apply
+        working-directory: terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="do_token=${{ secrets.DO_TOKEN }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="do_region=${{ secrets.DO_REGION }}" \
+            -var="registry_name=${{ needs.registry.outputs.registry_name }}"
+      - name: Capture Terraform outputs
+        id: tf_out
+        working-directory: terraform
+        run: |
+          CLUSTER_NAME=$(terraform output -raw cluster_name)
+          NAMESPACE=$(terraform output -raw namespace)
+          echo "cluster_name=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
+          echo "namespace=${NAMESPACE}"       >> $GITHUB_OUTPUT
+          echo "Cluster  : ${CLUSTER_NAME}"
+          echo "Namespace: ${NAMESPACE}"
+
+  # ── Deploy app to DOKS ──────────────────────────────────────────────────
+  deploy:
+    name: Deploy to DOKS (kubectl)
+    runs-on: ubuntu-latest
+    needs: [registry, build_push, provision]
+    outputs:
+      url: ${{ steps.svc.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_TOKEN }}
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.31.0'
+      - name: Save kubeconfig
+        run: |
+          doctl kubernetes cluster kubeconfig save "${{ needs.provision.outputs.cluster_name }}" \
+            --expiry-seconds 600
+      - name: Resolve context
+        run: |
+          NAMESPACE="${{ needs.provision.outputs.namespace }}"
+          PROJECT_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9-]/-/g' \
+            | sed 's/-\{2,\}/-/g' \
+            | sed 's/^-//; s/-$//')
+          echo "NAMESPACE=${NAMESPACE}"       >> $GITHUB_ENV
+          echo "PROJECT_NAME=${PROJECT_NAME}" >> $GITHUB_ENV
+      - name: Create namespace
+        run: |
+          kubectl create namespace "${NAMESPACE}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+      - name: Create DOCR pull secret
+        run: |
+          # doctl emits a ready-to-apply imagePullSecret manifest — much
+          # simpler than the AWS ECR dance (no IAM, no get-login-password).
+          doctl registry kubernetes-manifest \
+            --namespace "${NAMESPACE}" \
+            | kubectl apply -f -
+      - name: Create app env secret
+        run: |
+          # Build the literal args defensively — empty secret values are
+          # skipped so the secret only contains keys the app will actually
+          # use. This mirrors the EKS behavior but without the JSON hop.
+          ARGS=""
+          add_kv() {
+            local KEY="$1"
+            local VAL="$2"
+            if [ -n "$VAL" ]; then
+              ARGS="$ARGS --from-literal=${KEY}=${VAL}"
+            fi
+          }
+          add_kv DATABASE_URL              "${{ secrets.DATABASE_URL }}"
+          add_kv DB_HOST                   "${{ secrets.DB_HOST }}"
+          add_kv DB_PORT                   "${{ secrets.DB_PORT }}"
+          add_kv DB_NAME                   "${{ secrets.DB_NAME }}"
+          add_kv DB_USER                   "${{ secrets.DB_USER }}"
+          add_kv DB_USERNAME               "${{ secrets.DB_USERNAME }}"
+          add_kv DB_PASSWORD               "${{ secrets.DB_PASSWORD }}"
+          add_kv DB_TYPE                   "${{ secrets.DB_TYPE }}"
+          add_kv MONGO_URI                 "${{ secrets.MONGO_URI }}"
+          add_kv REDIS_URL                 "${{ secrets.REDIS_URL }}"
+          add_kv SECRET_KEY                "${{ secrets.SECRET_KEY }}"
+          add_kv JWT_SECRET                "${{ secrets.JWT_SECRET }}"
+          add_kv SPRING_DATASOURCE_URL     "${{ secrets.SPRING_DATASOURCE_URL }}"
+          add_kv SPRING_DATASOURCE_USERNAME "${{ secrets.SPRING_DATASOURCE_USERNAME }}"
+          add_kv SPRING_DATASOURCE_PASSWORD "${{ secrets.SPRING_DATASOURCE_PASSWORD }}"
+          add_kv SPRING_DATA_MONGODB_URI   "${{ secrets.SPRING_DATA_MONGODB_URI }}"
+          if [ -n "$ARGS" ]; then
+            kubectl create secret generic "${PROJECT_NAME}-env" \
+              --namespace "${NAMESPACE}" \
+              $ARGS \
+              --dry-run=client -o yaml | kubectl apply -f -
+          fi
+      - name: Apply Kubernetes manifests
+        run: |
+          IMAGE="${{ needs.build_push.outputs.image }}"
+          APP_PORT="${{ secrets.APP_PORT }}"
+          APP_PORT="${APP_PORT:-3000}"
+          HEALTH_PATH="/"
+          CPU_REQ="250m"
+          MEM_REQ="256Mi"
+          CPU_LIM="500m"
+          MEM_LIM="512Mi"
+          INIT_DELAY="30"
+
+          # DOCR pull secret name created by `doctl registry kubernetes-manifest`
+          # is "<registry-name>" by default (it appends the registry name).
+          PULL_SECRET=$(kubectl get secrets -n "${NAMESPACE}" \
+            -o jsonpath='{.items[?(@.type=="kubernetes.io/dockerconfigjson")].metadata.name}' \
+            | tr ' ' '\n' | head -n 1)
+          if [ -z "$PULL_SECRET" ]; then
+            echo "ERROR: no imagePullSecret found in namespace ${NAMESPACE}"
+            exit 1
+          fi
+
+          ENV_SECRET_REF=""
+          if kubectl get secret "${PROJECT_NAME}-env" -n "${NAMESPACE}" > /dev/null 2>&1; then
+            ENV_SECRET_REF="
+            - secretRef:
+                name: ${PROJECT_NAME}-env"
+          fi
+
+          # Service type=LoadBalancer triggers DO's cloud-controller-manager
+          # to provision a DigitalOcean Load Balancer automatically. No
+          # Ingress controller, no Helm chart needed — this is the big DOKS
+          # win over EKS.
+
+          kubectl apply -f - <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${PROJECT_NAME}
+            namespace: ${NAMESPACE}
+            labels:
+              app: ${PROJECT_NAME}
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: ${PROJECT_NAME}
+            strategy:
+              type: RollingUpdate
+              rollingUpdate:
+                maxSurge: 1
+                maxUnavailable: 0
+            template:
+              metadata:
+                labels:
+                  app: ${PROJECT_NAME}
+              spec:
+                imagePullSecrets:
+                  - name: ${PULL_SECRET}
+                containers:
+                  - name: ${PROJECT_NAME}
+                    image: ${IMAGE}
+                    ports:
+                      - containerPort: ${APP_PORT}
+                    envFrom:${ENV_SECRET_REF}
+                    resources:
+                      requests:
+                        cpu: ${CPU_REQ}
+                        memory: ${MEM_REQ}
+                      limits:
+                        cpu: ${CPU_LIM}
+                        memory: ${MEM_LIM}
+                    livenessProbe:
+                      httpGet:
+                        path: ${HEALTH_PATH}
+                        port: ${APP_PORT}
+                      initialDelaySeconds: ${INIT_DELAY}
+                      periodSeconds: 15
+                      failureThreshold: 3
+                    readinessProbe:
+                      httpGet:
+                        path: ${HEALTH_PATH}
+                        port: ${APP_PORT}
+                      initialDelaySeconds: $((INIT_DELAY / 2))
+                      periodSeconds: 10
+                      failureThreshold: 3
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${PROJECT_NAME}
+            namespace: ${NAMESPACE}
+            annotations:
+              # Force DO LB on the same region as the cluster, HTTP only.
+              service.beta.kubernetes.io/do-loadbalancer-protocol: "http"
+              service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: "${HEALTH_PATH}"
+              service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "${APP_PORT}"
+          spec:
+            type: LoadBalancer
+            selector:
+              app: ${PROJECT_NAME}
+            ports:
+              - port: 80
+                targetPort: ${APP_PORT}
+                protocol: TCP
+          EOF
+      - name: Wait for rollout
+        run: |
+          if ! kubectl rollout status deployment/${PROJECT_NAME} \
+               -n "${NAMESPACE}" --timeout=300s; then
+            echo "--- Pod status ---"
+            kubectl get pods -n "${NAMESPACE}" -l app="${PROJECT_NAME}"
+            echo "--- Pod events ---"
+            kubectl describe pods -n "${NAMESPACE}" -l app="${PROJECT_NAME}" | tail -40
+            echo "--- Pod logs (last 50 lines) ---"
+            kubectl logs -n "${NAMESPACE}" -l app="${PROJECT_NAME}" --tail=50 2>/dev/null || true
+            echo "Rollout did not complete — continuing to report LB anyway"
+          fi
+      - name: Get LoadBalancer URL
+        id: svc
+        run: |
+          echo "Waiting for DO LoadBalancer IP..."
+          LB_IP=""
+          for i in $(seq 1 30); do
+            LB_IP=$(kubectl get svc ${PROJECT_NAME} -n "${NAMESPACE}" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+            if [ -n "$LB_IP" ]; then
+              echo "url=http://${LB_IP}" >> $GITHUB_OUTPUT
+              echo "LoadBalancer IP: ${LB_IP}"
+              break
+            fi
+            echo "Attempt ${i}/30 — LB not ready, waiting 20s..."
+            sleep 20
+          done
+          if [ -z "$LB_IP" ]; then
+            echo "DO LoadBalancer IP not assigned within timeout — check DO console"
+            echo "url=" >> $GITHUB_OUTPUT
+          fi
+
+  verify:
+    name: Health Check
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: needs.deploy.outputs.url != ''
+    steps:
+      - name: Wait for app to be healthy
+        run: |
+          URL="${{ needs.deploy.outputs.url }}"
+          HEALTH_PATH="/health"
+          for i in $(seq 1 20); do
+            curl -sf "${URL}${HEALTH_PATH}" && break || sleep 15
+          done
+          curl -sf "${URL}${HEALTH_PATH}" \
+            || { echo "::warning title=Health check failed::${URL}${HEALTH_PATH} did not return 2xx after retries"; exit 0; }
+

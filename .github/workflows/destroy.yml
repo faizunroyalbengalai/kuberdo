@@ -1,0 +1,61 @@
+name: Destroy — kuberdo
+
+on:
+  workflow_dispatch:
+
+env:
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node24
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
+jobs:
+  destroy:
+    name: Terraform Destroy (DOKS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_TOKEN }}
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_SPACE }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}.tfstate" \
+            -backend-config="region=${{ secrets.DO_REGION }}" \
+            -backend-config="access_key=${{ secrets.SPACES_ACCESS_KEY }}" \
+            -backend-config="secret_key=${{ secrets.SPACES_SECRET_KEY }}" \
+            -backend-config="skip_requesting_account_id=true"
+      - name: Drain LoadBalancer Services before destroy
+        # DO LBs created by Service type=LoadBalancer are NOT in Terraform
+        # state — they were provisioned by the cloud-controller-manager.
+        # Deleting the cluster without deleting the Service first leaves
+        # orphan LBs that the user gets billed for. Clean them up first.
+        run: |
+          CLUSTER_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9-]/-/g' \
+            | sed 's/-\{2,\}/-/g' \
+            | sed 's/^-//; s/-$//' \
+            | cut -c1-32 \
+            | sed 's/-$//')
+          if doctl kubernetes cluster get "$CLUSTER_NAME" >/dev/null 2>&1; then
+            doctl kubernetes cluster kubeconfig save "$CLUSTER_NAME" --expiry-seconds 600
+            kubectl delete svc --all -A --field-selector spec.type=LoadBalancer --timeout=120s 2>/dev/null || true
+            # Give DO ~30s to drain the LB resources
+            sleep 30
+          else
+            echo "Cluster $CLUSTER_NAME not found — skipping LB drain"
+          fi
+      - name: Terraform destroy
+        working-directory: terraform
+        run: |
+          terraform destroy -auto-approve \
+            -var="do_token=${{ secrets.DO_TOKEN }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="do_region=${{ secrets.DO_REGION }}" \
+            -var="registry_name=${{ secrets.DOCR_REGISTRY_NAME }}"
